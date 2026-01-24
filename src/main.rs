@@ -23,7 +23,7 @@ enum Commands {
         name: String,
         
         /// [新增] 初始锁币金额 (单位: wei)，可选。如果不填默认 10 wei
-        /// 用法: cargo run -- user alice --amount 1000
+        /// 用法: cargo run -- user alice --amount 10
         #[arg(short, long)] 
         amount: Option<u128> 
     },
