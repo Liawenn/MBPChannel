@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
-use tokio::sync::broadcast; // [新增]
+use tokio::sync::broadcast; 
 
 // ==========================================
 // Core State Structure
@@ -73,7 +73,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
     let actor_cfg = get_actor_config(&config);
 
     // [新增] 创建停机信号通道
-    let (shutdown_tx, mut shutdown_rx) = broadcast::channel(1);
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel(16);
 
     println!("==== OPERATOR STARTUP SEQUENCE (Sequencer Mode) ====");
     println!("👤 Identity: Operator");
@@ -137,17 +137,20 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
         rep_socket.bind(&format!("tcp://0.0.0.0:{}", rep_port)).await.expect("Bind Rep failed");
         println!("👂 [Ingress] Listening on port {} ...", rep_port);
 
-        // [修复] 在 loop 外面创建 Receiver，保证生命周期
+        // [修复 1] 在 loop 外面创建 Receiver，解决 temporary value dropped 报错
         let mut shutdown_rx_ingress = shutdown_tx_ingress.subscribe();
 
         loop {
-            // [关键修改] 使用 tokio::select! 监听停机信号
+            // 使用 tokio::select! 监听停机信号
             let msg: ZmqMessage = tokio::select! {
                 res = rep_socket.recv() => match res {
                     Ok(m) => m,
                     Err(_) => continue,
                 },
-                _ = shutdown_rx_ingress.recv() => break,
+                _ = shutdown_rx_ingress.recv() => {
+                    println!("🛑 [Ingress] 收到停机信号，停止接收新请求...");
+                    break;
+                },
             };
 
             let payload = msg.get(0).expect("Empty msg");
@@ -187,7 +190,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
                 },
 
                 NetworkMessage::UpdateProposal { 
-                    user_name, counterparty_name, tx_id, prev_tx_id, amount,
+                    user_name, counterparty_name, tx_id, prev_tx_id, 
                     tx_amount_comm_hex, range_proof_b64, proof_comm_value_b64, 
                     sender_new_comm_hex, receiver_new_comm_hex, 
                     proposer_ephemeral_pk_hex, proposer_signature_b64, 
@@ -201,7 +204,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
 
                     if is_valid {
                         let proposal = NetworkMessage::UpdateProposal {
-                            user_name, counterparty_name, tx_id, prev_tx_id, amount,
+                            user_name, counterparty_name, tx_id, prev_tx_id,
+                            // [隐私] 这里不再包含 amount
                             tx_amount_comm_hex, range_proof_b64, proof_comm_value_b64,
                             sender_new_comm_hex, receiver_new_comm_hex,
                             proposer_ephemeral_pk_hex, proposer_signature_b64,
@@ -246,13 +250,19 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
                     };
 
                     if is_valid {
+                        // [修复 2] 使用 map_err 立即将 Error 转换为 String，避免 Send Trait 问题
                         match blockchain::initiate_close(
                             &close_actor_cfg, &close_rpc_url, close_contract, 
                             channel_id, final_tx_id, recipients, amounts, 
                             general_purpose::STANDARD.decode(&signature_b64).unwrap_or_default()
-                        ).await {
+                        ).await.map_err(|e| e.to_string()) {
                             Ok(tx) => {
-                                // 1. 将关闭通知推入 Mempool 供 Sequencer 广播
+                                // 1. 先回复 OK
+                                let resp = NetworkMessage::CloseConsensus { status: "OK".to_string(), final_tx_id, close_token: tx };
+                                let resp_str = serde_json::to_string(&resp).unwrap();
+                                let _ = rep_socket.send(ZmqMessage::from(resp_str)).await;
+
+                                // 2. 放入 Mempool，让 Sequencer 广播 ChannelClosed
                                 let broadcast = NetworkMessage::ChannelClosed {
                                     channel_id_hex: channel_id_hex.clone(),
                                     closer: user_name.clone(),
@@ -264,13 +274,14 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
                                 }
                                 ctx_ingress.notify.notify_one();
 
-                                // 2. [关键修改] 触发 Operator 倒计时关闭
-                                println!("⏳ [System] 收到关闭信号，Operator 将在 10 秒后自动退出...");
+                                // 3. 触发 Operator 倒计时关闭
+                                println!("⏳ [System] 收到关闭信号，Operator 将在 60 秒后自动退出...");
                                 let _ = shutdown_tx_ingress.send(());
 
-                                NetworkMessage::CloseConsensus { status: "OK".to_string(), final_tx_id, close_token: tx }
+                                // 因为手动发送了响应，跳过循环尾部的自动发送
+                                continue;
                             },
-                            Err(e) => NetworkMessage::CloseConsensus { status: "ERROR".to_string(), final_tx_id: 0, close_token: e.to_string() }
+                            Err(e_str) => NetworkMessage::CloseConsensus { status: "ERROR".to_string(), final_tx_id: 0, close_token: e_str }
                         }
                     } else {
                         NetworkMessage::CloseConsensus { status: "REJECT".to_string(), final_tx_id: 0, close_token: "Invalid ID".to_string() }
@@ -287,6 +298,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
     // ---------------------------------------------------------
     // Task B: Sequencer (Ordering & Consensus)
     // ---------------------------------------------------------
+    // [修复 1] 在 loop 外面创建 Receiver
     let mut shutdown_rx_sequencer = shutdown_tx.subscribe();
 
     let task_sequencer = tokio::spawn(async move {
@@ -343,8 +355,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
                 Some(tx) => tx,
                 None => {
                     tokio::select! {
-                        _ = ctx_sequencer.notify.notified() => continue, // 有新消息
-                        _ = shutdown_rx_sequencer.recv() => break, // 收到停机信号
+                        _ = ctx_sequencer.notify.notified() => continue, 
+                        _ = shutdown_rx_sequencer.recv() => {
+                            // 收到停机信号，继续循环以清空队列中的广播（如 ChannelClosed）
+                            continue; 
+                        }
                     }
                 }
             };
@@ -362,7 +377,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
                 },
 
                 NetworkMessage::UpdateProposal { 
-                    user_name, counterparty_name, tx_id, amount,
+                    user_name, counterparty_name, tx_id, 
                     tx_amount_comm_hex, range_proof_b64, proof_comm_value_b64, 
                     sender_new_comm_hex, receiver_new_comm_hex, ..
                 } => {
@@ -426,7 +441,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
                                 sender_new_comm_hex,
                                 receiver_name: counterparty_name.clone(),
                                 receiver_new_comm_hex,
-                                amount, 
+                                // [隐私] amount 被移除
                             };
                             
                             if let Ok(json) = serde_json::to_string(&consensus_msg) {
@@ -450,11 +465,10 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
     // ---------------------------------------------------------
     // Main Wait Loop
     // ---------------------------------------------------------
-    // [关键修改] 等待 shutdown 信号或任务 Panic
     tokio::select! {
         _ = shutdown_rx.recv() => {
             println!("🛑 [System] 正在等待广播发送完成 (Sleep 10s)...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             println!("👋 Operator 关闭。");
         },
         _ = task_ingress => {

@@ -11,24 +11,20 @@ pub enum NetworkMessage {
         pk_hex: String,
         initial_balance_comm_hex: String,
         initial_balance_proof_b64: String,
-        // 显式传递初始余额，用于 Demo 状态追踪
         initial_balance: u64, 
     },
     
-    // [Operator -> User]
     JoinResponse { status: String, message: String, channel_id_hex: String },
 
-    // [Sequencer -> All]
     ChannelFinalized {
         channel_id_hex: String,
-        // 元组: (Name, PK, Comm, Balance)
         participants: Vec<(String, String, String, u64)>, 
     },
 
-    // [User <-> User] P2P
+    // [User <-> User] P2P (这里必须保留 amount，因为接收方需要知道收了多少钱)
     P2PUpdateReq {
         tx_id: u64,
-        amount: u64,
+        amount: u64, 
         commitment_hex: String,
         range_proof_b64: String,
         comm_value_b64: String,
@@ -44,13 +40,13 @@ pub enum NetworkMessage {
     },
 
     // [User -> Operator]
+    // ⚠️ 隐私修改点：删除了 amount 字段
     UpdateProposal {
         user_name: String,
         counterparty_name: String,
         tx_id: u64,
         prev_tx_id: u64,
-        // 显式传递交易金额，供 Operator 广播
-        amount: u64, 
+        // amount: u64,  <-- 已删除，Operator 不再知道金额
         tx_amount_comm_hex: String,
         range_proof_b64: String,
         proof_comm_value_b64: String,
@@ -86,6 +82,7 @@ pub enum NetworkMessage {
     },
 
     // [Sequencer -> All]
+    // ⚠️ 隐私修改点：删除了 amount 字段
     ConsensusReached {
         tx_id: u64,
         status: String,
@@ -94,29 +91,23 @@ pub enum NetworkMessage {
         sender_new_comm_hex: String,
         receiver_name: String,
         receiver_new_comm_hex: String,
-        // 广播金额，让全网更新本地账本
-        amount: u64, 
+        // amount: u64, <-- 已删除，全网广播不再包含金额
     },
 
-    // [User -> Operator]
     CloseRequest {
         user_name: String,
         channel_id_hex: String,
         final_tx_id: u64,
         signature_b64: String,
-        // 必须携带最终的明文余额列表，否则合约会计算溢出
         final_balances: HashMap<String, u64>, 
     },
 
-    // [Operator -> User (Requester)]
     CloseConsensus {
         status: String,
         final_tx_id: u64,
         close_token: String,
     },
 
-    // [Sequencer -> All]
-    // [新增] 用于通知所有在线用户通道已关闭
     ChannelClosed {
         channel_id_hex: String,
         closer: String,
